@@ -1,0 +1,10 @@
+locals {
+  common_tags = {
+    email       = "charles.caygill@sainsburys.co.uk"
+    costcentre  = "PD6691"
+    live        = var.environment == "prod" ? "no" : "no"
+    environment = var.environment
+  }
+
+  tags = var.environment == "prod" ? merge(local.common_tags, { servicecatalogueID = "001002646" }) : merge(local.common_tags, { servicename = "Pollen" })
+}

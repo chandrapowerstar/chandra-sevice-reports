@@ -1,0 +1,7 @@
+# Provider Variables
+aws_profile = "pollen-nonprod"
+environment = "dev"
+
+# Required variables
+alb_domain             = "dev.jspollen.com"
+terraform-state-bucket = "966270299484-terraform-state"

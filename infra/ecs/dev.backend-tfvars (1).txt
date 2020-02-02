@@ -1,0 +1,4 @@
+bucket  = "966270299484-terraform-state"
+key     = "dev/ecs-authorisation.tfstate"
+profile = "pollen-nonprod"
+region  = "eu-west-1"
