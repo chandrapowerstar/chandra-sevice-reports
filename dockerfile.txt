@@ -1,0 +1,18 @@
+FROM openjdk:11-jre-slim
+RUN mkdir -p /code
+COPY ./newrelic/nrcerts /code/nrcerts
+COPY ./newrelic/newrelic.yml /code/newrelic.yml
+COPY ./newrelic/newrelic.jar /code/newrelic.jar
+COPY target/*.jar /code/pollen-service-login.jar
+ENV REDIS_HOST dev-ec.goym10.0001.euw1.cache.amazonaws.com
+ENV POSTGRES_HOST pollen-dev-rds.c7weoid9f823.eu-west-1.rds.amazonaws.com
+ENV POSTGRES_PASSWORD PollenDevPostGreSQL2019
+ENV AZURE_TENANT_ID b2eb8529-51f8-4d43-92bf-85201eea6023
+ENV AZURE_CLIENT_ID 3cfce384-5f07-45a8-88c3-dedaa2fabab7
+ENV AZURE_CLIENT_SECRET 7hwUwee+uIPHUVReQerzXTiO3mo7XQcrZgqs+elHTlE=
+ENV NEW_RELIC_APP_NAME "Pollen Authorisation Service - ${ENV}"
+ENV CSRF_ENABLE true
+ENV LOG_DIR /
+EXPOSE 8030
+WORKDIR /code/
+ENTRYPOINT ["java","-javaagent:newrelic.jar", "-jar","pollen-service-login.jar"]

@@ -1,0 +1,643 @@
+// Input variables for running the pipeline
+env.MICRO_SERVICE_TO_BUILD = "auth"
+env.SERVICE_USAGE_NAME = "authorisation"
+env.GH_CREDS_ID = 'pollen-sainsburys-bot-ssh'
+env.SONAR_URL = "http://localhost:9000"
+env.ECS_CLUSTER = "middleware-cluster"
+env.SMOKE_TEST = "SmokeTest"
+env.REGRESSION_TEST = "Regression"
+
+// Constructed variables
+env.SOURCE_CODE_URL = "git@github.com:SainsburysNDA/pollen-service-" + SERVICE_USAGE_NAME + ".git"
+
+// Commit Details
+env.COMMIT_HASH = "latest"
+env.COMMITER_NAME
+env.COMMIT_MESSAGE
+env.SOURCE_BRANCH = "null"
+env.DOCKER_IMAGE
+
+// JIRA variables
+env.TICKET_KEY = "null"
+
+// Environment variables for catching the exceptions
+env.MESSAGE = ""
+env.MANIFEST
+env.COMMIT_HASH_DOCKER_DB
+
+//Variable for change Id
+env.CHANGE_ID_UAT = ""
+env.CHANGE_URL_UAT = "https://uat.change.eng-nonprod.js-devops.co.uk/sops/change/"
+env.CHANGE_URL_PROD = "https://change.eng.js-devops.co.uk/sops/change/"
+
+def getDetails(){
+
+    env.COMMIT_HASH = sh(returnStdout: true, script: 'git rev-parse HEAD').take(7)
+    env.COMMITER_NAME = sh( script: 'git --no-pager show -s --format=\'%an\'', returnStdout: true).trim()
+    env.COMMIT_MESSAGE = sh(script: 'git log -1  --pretty=\'%s\'', returnStdout: true)
+
+    println "This build is for the commit : ${COMMIT_HASH} was done by ${COMMITER_NAME} on branch ${BRANCH_NAME}"
+
+}
+
+def RepoCheck(){
+    dir("infra/ecr"){
+        sshagent(['pollen-sainsburys-bot-ssh']) {
+            ansiColor('xterm') {
+                sh 'terraform init'
+                sh 'terraform plan -var="ecr_repo_name=sainsburysnda/pol-'+ MICRO_SERVICE_TO_BUILD + '"'
+                sh 'terraform apply -var="ecr_repo_name=sainsburysnda/pol-'+ MICRO_SERVICE_TO_BUILD + '" -auto-approve'
+            }
+        }
+    }
+}
+
+def envDeploy(environment,ecrTag){
+    dir("infra/ecs"){
+        sshagent(['pollen-sainsburys-bot-ssh']) {
+            ansiColor('xterm') {
+                sh 'terraform init -backend-config="' + environment + '-backend.tfvars"'
+                sh 'terraform plan -var-file="' + environment + '.tfvars" -var="APPLICATION_VERSION=' + ecrTag + '"'
+                sh 'terraform apply -auto-approve -var-file="' + environment + '.tfvars" -var="APPLICATION_VERSION=' + ecrTag + '"'
+            }
+        }
+    }
+}
+
+def healthCheck(clusterName, serviceName, expectedTag) {
+    def responseStatus = sh(script : 'aws ecs list-tasks --cluster ' + clusterName + ' --region ' + AWS_REGION + ' --service-name '+ serviceName + ' --desired-status RUNNING', returnStatus : true)
+    if (responseStatus == 255) {
+        error ("Jenkins unable to find the ECS cluster. Hence health checks cannot be done.")
+        currentBuild.result = 'FAILURE'
+    }
+    int count = 0
+    boolean skipRetry = false
+    for (i = 1; i <=15; i++) {
+        int flag = 0
+        try {
+            println "Hit number: ${i}"
+            def taskArns = sh(script : 'aws ecs list-tasks --cluster ' + clusterName + ' --region ' + AWS_REGION + ' --service-name '+ serviceName + ' --desired-status RUNNING --query "taskArns[*]"', returnStdout : true)
+            def parsedtaskArns = readJSON text: taskArns
+            if (parsedtaskArns.isEmpty()) {
+                println "There are no tasks running in ECS for this micro-service."
+                if(count > 1){
+                    skipRetry = true
+                }
+            } else {
+                println "Printing list of ECS tasks' ARNs..."
+                println parsedtaskArns
+                def imageList = []
+                for (taskArn in parsedtaskArns) {
+                    def taskDefArn = sh(script : 'aws ecs describe-tasks --region ' + AWS_REGION + ' --cluster ' + clusterName + ' --tasks ' + taskArn + ' --query "tasks[*].taskDefinitionArn" --output text', returnStdout : true)
+                    def containerDef = sh(script : 'aws ecs describe-task-definition --region ' + AWS_REGION + ' --query "taskDefinition.containerDefinitions" --task-definition ' + taskDefArn, returnStdout : true)
+                    def parsedContainerDef = readJSON text: containerDef
+                    imageList << parsedContainerDef.image[0].substring(parsedContainerDef.image[0].length() - 7)
+                }
+                if(expectedTag in imageList){
+                    flag = 1
+                    count++
+                }
+                if(count > 1 && flag == 0) {
+                    skipRetry = true
+                }
+            }
+        } catch(all) {
+            println "Health check failed in this hit"
+        }
+        if(count == 5 || skipRetry){
+            break
+        }
+        if(i!=10){
+            sleep 5
+            println "Retrying.."
+        }
+    }
+    if (count == 5){
+        println "Application is healthy"
+    }
+    else{
+        error ("Health checks failed")
+        currentBuild.result = 'FAILURE'
+    }
+}
+
+def flyway(host,password,action){
+    try{
+        dir("infra/pollen-docker-database"){
+            sh "docker run --rm --network=host -v " + '${PWD}' + "/MigrationScripts:/flyway/sql -v " + '${PWD}' + "/FlywayConf:/flyway/conf flyway/flyway:latest-alpine -user=pollen -url=jdbc:postgresql://${host}:5432/pollen -password='${password}' " + action
+        }
+    }catch(all){
+        if(action == "validate")
+            return false
+        error ("Flyway migration failed")
+            currentBuild.result = 'FAILURE'
+    }
+    return true
+}
+
+def gitTag(tag){
+    sshagent(['pollen-sainsburys-bot-ssh']){
+        sh('''git config url.git@github.com:.insteadOf https://github.com/
+              git tag -f ''' + tag + '''
+                 git push -f origin --tags''')
+    }
+}
+
+boolean automatedTestRun(microservice, testtype){
+    try{
+        def latestTag = sh(script : 'aws ecr describe-images --repository-name sainsburysnda/pol-test-automated --query "sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]" --output text --region ${AWS_REGION}', returnStdout : true).trim()
+        sh 'docker pull ' + ECR_REGISTRY + '/sainsburysnda/pol-test-automated:'+ latestTag
+        sh 'docker run --rm --env environment=' + microservice + testtype + ' -v ${PWD}/test/' + testtype + '/reports/:/workdir/test/reports/ ' + ECR_REGISTRY + '/sainsburysnda/pol-test-automated:' + latestTag
+    }catch(all){
+        println "Problem with " + testtype + " test"
+    }
+    println "Generating cucumber report for the " + testtype + " test run"
+    cucumber buildStatus: 'FAILURE',
+        fileIncludePattern: '**/test/' + testtype + '/reports/cucumber-results/*.json',
+        trendsLimit: 10,
+        failedFeaturesNumber: 0
+
+    if(currentBuild.result=='FAILURE')
+        return false
+    return true
+}
+
+def reTagEcrImage(microservice,currentTag,newTag){
+    def response = sh(script : 'aws ecr describe-images --region ${AWS_REGION} --repository-name sainsburysnda/pol-' + microservice + ' --image-ids imageTag=' + currentTag, returnStdout : true)
+    def parsedResponse = readJSON text: response
+    def imageTags = parsedResponse.imageDetails.imageTags
+    parsedResponse = null
+    println "The tag(s) existing in the image: "+imageTags[0]
+
+    if (!(imageTags[0].contains(newTag))) {
+        env.MANIFEST = sh(script : 'aws ecr batch-get-image --repository-name sainsburysnda/pol-' + microservice + ' --image-ids imageTag=' + currentTag + ' --query images[].imageManifest --output text --region ${AWS_REGION}', returnStdout : true).trim()
+        sh 'aws ecr put-image --region ${AWS_REGION} --repository-name sainsburysnda/pol-'+ microservice + ' --image-tag '+ newTag +' --image-manifest "$MANIFEST"'
+     }
+}
+
+def setMessage(){
+    if(currentBuild.result == 'SUCCESS'){
+        if(env.BRANCH_NAME == 'develop')
+            MESSAGE = "Integrated and Deployed successfully in Dev, Test & Preprod environments and waiting for approval for deployment in Prod environment for the commit"
+          else
+             MESSAGE = "Integration is successful for the commit"
+    }
+    else
+          MESSAGE = "Pipeline failed for the commit"
+
+    MESSAGE = MESSAGE + " ${COMMIT_HASH} by ${COMMITER_NAME} for pollen-service-${MICRO_SERVICE_TO_BUILD}"
+    println MESSAGE
+}
+
+def teamsNotification(){
+    office365ConnectorSend message: "${MESSAGE}", status:"${currentBuild.result}", webhookUrl: "${MSTEAMS_HOOK_URL}"
+}
+
+def jiraNotification(){
+    if(TICKET_KEY != "null")
+        jiraAddComment site: 'Pollen', idOrKey: "${TICKET_KEY}", comment: "${MESSAGE}"
+}
+
+def updateChange(apikey,url,change_id,status){
+    change_response = sh(returnStdout: true, script:'curl --header "x-api-key: ' + apikey + '" --header "Content-Type: application/json" --request POST --show-error --fail --data \'{}\' ' + url + change_id + '/' + status)
+    println "Change API response " + change_response
+}
+
+pipeline {
+    agent any
+    tools{
+        maven 'MAVEN_HOME'
+        jdk 'JAVA_11'
+    }
+    environment{
+       SONAR_ACCESS_TOKEN = credentials('sonar-access-token')
+       MSTEAMS_HOOK_URL   = credentials('msteams-hook-url')
+       ECR_REGISTRY       = credentials('ecr-registry-arn')
+       AWS_REGION         = credentials('aws-region')
+    }
+    options { timestamps () }
+    stages{
+        stage('Get Details'){
+             steps{
+               getDetails()
+             }
+         }
+        stage('build'){
+            steps{
+              sh 'mvn clean compile'
+            }
+        }
+        stage('package'){
+            steps{
+                sh 'mvn package'
+            }
+        }
+        stage('Code quality check - sonarqube'){
+            steps{
+                withSonarQubeEnv('Sonarqube'){
+                     sh 'mvn sonar:sonar'
+                }
+            }
+        }
+        stage("Abort Job if Quality not met") {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        stage('Docker Build'){
+            steps{
+                script{
+                    DOCKER_IMAGE = docker.build(ECR_REGISTRY + "/sainsburysnda/pol-" + MICRO_SERVICE_TO_BUILD + ":"+ COMMIT_HASH)
+                }
+            }
+        }
+        stage('ECR Push'){
+            when {
+                   expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                credentialsId: 'pollen_nonprod_service_user']]) {
+                    RepoCheck()
+                    sh 'eval $(aws ecr get-login --no-include-email --region ' + AWS_REGION + ')'
+                    script{
+                        DOCKER_IMAGE.push()
+                    }
+                }
+            }
+        }
+        stage('Checkout pollen-docker-database for Dev DB migration through Flyway'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                dir("infra"){
+                    dir("pollen-docker-database"){
+                        checkout ( [$class: 'GitSCM',
+                        branches: [[name: "develop" ]],
+                        userRemoteConfigs: [[credentialsId: "${GH_CREDS_ID}",
+                        url: 'git@github.com:SainsburysNDA/pollen-docker-database.git']]])
+                        script{
+                            env.COMMIT_HASH_DOCKER_DB = sh(returnStdout: true, script: 'git rev-parse HEAD').take(7)
+                        }
+                    }
+                }
+            }
+        }
+        stage('Docker run validate & migrate Dev DB flyway migration script'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                script{
+                    withCredentials([string(credentialsId: 'dev-postgres-host', variable: 'host')]){
+                    withCredentials([string(credentialsId: 'dev-postgres-password', variable: 'password')]){
+                      if (!(flyway(host,password,'validate')))
+                            flyway(host,password,'migrate')
+                      println "Printing information about migration"
+                      flyway(host,password,'info')
+                    }
+                    }
+                }
+            }
+        }
+        stage('Deployment in Dev environment through terraform'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                println "Deploying in Dev environment"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                credentialsId: 'pollen_nonprod_service_user']]) {
+                    envDeploy('dev',COMMIT_HASH)
+                }
+            }
+        }
+        stage('Health check'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                sleep 10
+                println "Starting Health Checks"
+                script{
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                    credentialsId: 'pollen_nonprod_service_user']]) {
+                        healthCheck("dev-"+ ECS_CLUSTER,"dev-pol-"+MICRO_SERVICE_TO_BUILD, COMMIT_HASH)
+                    }
+                }
+            }
+        }
+        stage('Smoke Testing'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                sleep 10
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                         credentialsId: 'pollen_nonprod_service_user']]) {
+                    script{
+                        if(automatedTestRun(MICRO_SERVICE_TO_BUILD,SMOKE_TEST))
+                            println "Smoke test run successfully done. Deploying the image in test environment"
+                        else
+                            error("Aborting the pipeline")
+                    }
+                }
+            }
+        }
+        stage('Tag the commit in GitHub after dev deployment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                gitTag('dev')
+            }
+        }
+        stage('Docker run validate & migrate Test DB flyway migration script'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                script{
+                    withCredentials([string(credentialsId: 'test-postgres-host', variable: 'host')])  {
+                    withCredentials([string(credentialsId: 'test-postgres-password', variable: 'password')])  {
+                        if (!(flyway(host,password,'validate')))
+                            flyway(host,password,'migrate')
+                        println "Printing information about migration"
+                        flyway(host,password,'info')
+                    }
+                    }
+                }
+            }
+        }
+        stage('Deployment in Test environment through terraform'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+            println "Deploying in Test environment"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'pollen_nonprod_service_user']]) {
+                    envDeploy('test',COMMIT_HASH)
+                }
+            }
+        }
+        stage('Health check for Test environment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                sleep 10
+                println "Starting Health Checks"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                    credentialsId: 'pollen_nonprod_service_user']]) {
+                    healthCheck("test-"+ ECS_CLUSTER,"test-pol-"+MICRO_SERVICE_TO_BUILD, COMMIT_HASH)
+                }
+            }
+        }
+        stage('Regression testing'){
+            when {
+                    expression { BRANCH_NAME == 'develop' }
+                }
+            steps{
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'pollen_nonprod_service_user']]) {
+                script{
+                    if(automatedTestRun(MICRO_SERVICE_TO_BUILD,REGRESSION_TEST))
+                        println "Regression test run successfully done."
+                    else
+                        error("Aborting the pipeline")
+                    }
+                }
+            }
+        }
+        stage('Re Tag the image in ECR after test deployment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                              credentialsId: 'pollen_nonprod_service_user']]) {
+                    reTagEcrImage(MICRO_SERVICE_TO_BUILD,COMMIT_HASH,"Promoted_To_Test")
+                }
+            }
+        }
+        stage('Tag the commit in GitHub after test deployment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                gitTag('test')
+            }
+        }
+        stage ('Create a change request in preprod/uat'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([string(credentialsId: 'uat-sops-api-key', variable: 'SOPS_API_KEY')])  {
+                    script{
+                        CHANGE_DESC = sh(returnStdout: true, script: 'git log preprod..HEAD --pretty=format:\'%h - %s (%an)\'')
+                        println CHANGE_DESC
+                        def changejson = readJSON text: '{}'
+                        changejson.deploymentItem = "Pollen" as String
+                        changejson.assignmentGroup = "Pollen" as String
+                        changejson.description = "Change for this deployment: ${CHANGE_DESC}" as String
+                        writeJSON (file: "changerequest.json", json: changejson)
+                        change_response = sh(returnStdout: true, script:'curl --header "x-api-key: ' + SOPS_API_KEY + '" --header "Content-Type: application/json" --request POST --show-error --fail --data @changerequest.json https://uat.change.eng-nonprod.js-devops.co.uk/sops/change')
+                        println "Change API response " + change_response
+                        def createResponse = readJSON text: change_response
+                        env.CHANGE_ID_UAT=createResponse.id
+                    }
+                }
+            }
+        }
+        stage('Docker run validate & migrate Preprod DB flyway migration script'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([string(credentialsId: 'preprod-postgres-host', variable: 'host')])  {
+                withCredentials([string(credentialsId: 'preprod-postgres-password', variable: 'password')])  {
+                    script{
+                        if (!(flyway(host,password,'validate')))
+                            flyway(host,password,'migrate')
+                        println "Printing information about migration"
+                        flyway(host,password,'info')
+                    }
+                }
+                }
+            }
+        }
+        stage('Deploy to Preprod'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'pollen_nonprod_service_user']]) {
+                    envDeploy('preprod',COMMIT_HASH)
+                }
+            }
+        }
+        stage('Health check for Preprod environment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                sleep 10
+                println "Starting Health Checks"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'pollen_nonprod_service_user']]) {
+                    healthCheck("preprod-"+ ECS_CLUSTER,"preprod-pol-"+MICRO_SERVICE_TO_BUILD, COMMIT_HASH)
+                }
+            }
+        }
+        stage('Re-Tag the Docker image'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'pollen_nonprod_service_user']]) {
+                    script{
+                        env.MANIFEST = sh(script : 'aws ecr batch-get-image --repository-name sainsburysnda/pol-' + MICRO_SERVICE_TO_BUILD + ' --image-ids imageTag=' + COMMIT_HASH + ' --query images[].imageManifest --output text --region ${AWS_REGION}', returnStdout : true).trim()
+                        sh 'aws ecr put-image --region ${AWS_REGION} --repository-name sainsburysnda/pol-'+ MICRO_SERVICE_TO_BUILD + ' --image-tag QA_Verified --image-manifest "$MANIFEST"'
+                    }
+                }
+            }
+        }
+        stage ('Succeed the change API in preprod/uat'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                withCredentials([string(credentialsId: 'uat-sops-api-key', variable: 'SOPS_API_KEY')])  {
+                    updateChange(SOPS_API_KEY, CHANGE_URL_UAT, CHANGE_ID_UAT, 'succeed')
+                }
+            }
+        }
+        stage('Tag the commit in GitHub after preprod deployment'){
+            when {
+                expression { BRANCH_NAME == 'develop' }
+            }
+            steps{
+                gitTag('preprod')
+            }
+        }
+    }
+    post{
+        failure{
+            script{
+                if (BRANCH_NAME == 'develop' && CHANGE_ID_UAT != ""){
+                    withCredentials([string(credentialsId: 'uat-sops-api-key', variable: 'SOPS_API_KEY')])  {
+                        updateChange(SOPS_API_KEY, CHANGE_URL_UAT, CHANGE_ID_UAT, 'fail')
+                    }
+                }
+            }
+        }
+        always{
+            setMessage()
+            script{
+                if(BRANCH_NAME == 'develop'){
+                    teamsNotification()
+                  //  jiraNotification() JIRA notification will be enabled later.
+                }
+             }
+            deleteDir()
+        }
+    }
+}
+if(BRANCH_NAME == 'develop'){
+    stage('Approval for promotion to production environment'){
+            input(id: "Production deploy Gate", message: "Do you want to deploy to Production environment?", ok: 'Deploy to Production')
+    }
+    node{
+        def change_id = ""
+        withCredentials([string(credentialsId: 'aws-region', variable: 'AWS_REGION')]){
+        withCredentials([string(credentialsId: 'aws-nonprod-account-number', variable: 'AWS_NONPROD_ACCOUNT_NUMBER')]){
+        withCredentials([string(credentialsId: 'prod-sops-api-key', variable: 'SOPS_API_KEY')]){
+            try{
+                stage('Checkout service code'){
+                    checkout ( [$class: 'GitSCM',
+                    branches: [[name: "${COMMIT_HASH}" ]],
+                    userRemoteConfigs: [[credentialsId: "${GH_CREDS_ID}",
+                    url: 'git@github.com:SainsburysNDA/pollen-service-' + MICRO_SERVICE_TO_BUILD + '.git']]])
+                }
+                stage ('Create a change request'){
+                    CHANGE_DESC = sh(returnStdout: true, script: 'git log prod..HEAD --pretty=format:\'%h - %s (%an)\'')
+                    println CHANGE_DESC
+                    def changejson = readJSON text: '{}'
+                    changejson.deploymentItem = "Pollen" as String
+                    changejson.assignmentGroup = "Pollen" as String
+                    changejson.description = "Change for this deployment: ${CHANGE_DESC}" as String
+                    writeJSON (file: "changerequest.json", json: changejson)
+                    change_response = sh(returnStdout: true, script:'curl --header "x-api-key: ' + SOPS_API_KEY + '" --header "Content-Type: application/json" --request POST --show-error --fail --data @changerequest.json https://change.eng.js-devops.co.uk/sops/change')
+                    println "Change API response " + change_response
+                    def createResponse = readJSON text: change_response
+                    change_id=createResponse.id
+                }
+                stage('Checkout pollen-docker-database for prod DB migration through Flyway'){
+                    dir("infra/pollen-docker-database"){
+                        checkout ( [$class: 'GitSCM',
+                        branches: [[name: "${COMMIT_HASH_DOCKER_DB}" ]],
+                        userRemoteConfigs: [[credentialsId: "${GH_CREDS_ID}",
+                        url: 'git@github.com:SainsburysNDA/pollen-docker-database.git']]])
+                    }
+                }
+                stage('Docker run validate & migrate prod DB flyway migration script'){
+                    withCredentials([string(credentialsId: 'prod-postgres-host', variable: 'host')])  {
+                        withCredentials([string(credentialsId: 'prod-postgres-password', variable: 'password')])  {
+                              if (!(flyway(host,password,'validate')))
+                                    flyway(host,password,'migrate')
+                              println "Printing information about migration"
+                              flyway(host,password,'info')
+                        }
+                    }
+                }
+                stage('Deploy to Prod'){
+                    println "Promoting the Docker image to production environment"
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',credentialsId: 'pollen_prod_service_user']]) {
+                        envDeploy('prod',COMMIT_HASH)
+                    }
+                }
+                stage('Health check for Prod environment'){
+                    steps{
+                        sleep 10
+                        println "Starting Health Checks"
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'pollen_prod_service_user']]) {
+                            healthCheck("prod-"+ ECS_CLUSTER,"prod-pol-"+MICRO_SERVICE_TO_BUILD, COMMIT_HASH)
+                        }
+                    }
+                }
+                stage('Re-Tag the Docker image'){
+                    def releaseTag = readMavenPom().getVersion() + "_prod"
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                    credentialsId: 'pollen_prod_service_user']]) {
+                        env.MANIFEST = sh(script : 'aws ecr batch-get-image --registry-id ' + AWS_NONPROD_ACCOUNT_NUMBER + ' --repository-name sainsburysnda/pol-' + MICRO_SERVICE_TO_BUILD + ' --image-ids imageTag=' + COMMIT_HASH + ' --query images[].imageManifest --output text --region ${AWS_REGION}', returnStdout : true).trim()
+                        sh 'aws ecr put-image --registry-id ' + AWS_NONPROD_ACCOUNT_NUMBER + ' --region ${AWS_REGION} --repository-name sainsburysnda/pol-'+ MICRO_SERVICE_TO_BUILD + ' --image-tag ' + releaseTag + ' --image-manifest "$MANIFEST"'
+                    }
+                }
+                stage ('Succeed the change'){
+                    updateChange(SOPS_API_KEY, CHANGE_URL_PROD, change_id, 'succeed')
+                }
+                stage('Tag the commit in GitHub after prod deployment'){
+                    gitTag('prod')
+                }
+            }catch(all){
+                println all.getMessage()
+                if (change_id != ""){
+                    updateChange(SOPS_API_KEY, CHANGE_URL_PROD, change_id, 'fail')
+                }
+                error ("Unable to promote the Docker image to production environment")
+            }
+            finally{
+                deleteDir()
+            }
+        }
+        }
+        }
+    }
+}
